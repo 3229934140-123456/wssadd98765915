@@ -447,6 +447,179 @@ async function runTests() {
     assert('\u6587\u672c\u7248\u5f02\u5e38\u65f6\u95f4\u7ebf\u542b VIOLATION',
       multiEvidence.text_conclusion.includes('VIOLATION') || multiEvidence.text_conclusion.includes('WARNING'));
 
+    console.log('\n[18] 签收风险评估 - 正常运单建议签收');
+    const safeWaybillNo = 'TEST-SAFE-001';
+    r = await httpRequest('POST', '/api/waybills', {
+      waybill_no: safeWaybillNo,
+      meat_type: '冷鲜猪肉',
+      zone_code: 'CHILLED',
+      shipper: '双汇食品',
+      consignee: '某超市',
+      origin: '河南漯河',
+      destination: '上海浦东'
+    });
+    assert('安全运单创建成功', r.status === 201 && r.body.code === 0);
+
+    r = await httpRequest('POST', '/api/segments/batch', {
+      segments: [
+        { waybill_no: safeWaybillNo, start_time: '2026-06-21T08:00:00', end_time: '2026-06-21T10:00:00',
+          avg_temp: 2, min_temp: 0, max_temp: 3, location_name: '高速路段', door_open: 0, cooler_status: 'normal' },
+        { waybill_no: safeWaybillNo, start_time: '2026-06-21T10:00:00', end_time: '2026-06-21T12:00:00',
+          avg_temp: 2.5, min_temp: 1, max_temp: 3.5, location_name: '服务区', door_open: 0, cooler_status: 'normal' }
+      ]
+    });
+    assert('安全运单片段上传成功', r.status === 200 && r.body.data.success === 2);
+
+    r = await httpRequest('GET', '/api/summary/waybill/' + safeWaybillNo);
+    assert('安全运单摘要查询成功', r.status === 200 && r.body.code === 0);
+    const safeSummary = r.body.data;
+    assert('含 signoff_risk 字段', safeSummary.signoff_risk != null);
+    assert('正常运单建议签收', safeSummary.signoff_risk.level === 'suggest_signoff',
+      '实际=' + safeSummary.signoff_risk.level);
+    assert('签收标签正确', safeSummary.signoff_risk.label === '建议签收');
+    assert('有风险因素数组', Array.isArray(safeSummary.signoff_risk.factors) && safeSummary.signoff_risk.factors.length > 0);
+    assert('affects_signoff 为 false', safeSummary.affects_signoff === false);
+    assert('signoff_note 包含正常签收', safeSummary.signoff_note.includes('正常签收') || safeSummary.signoff_note.includes('可正常签收'));
+
+    console.log('\n[19] 签收风险评估 - 严重违规建议拒收');
+    const badWaybillNo = 'TEST-BAD-001';
+    r = await httpRequest('POST', '/api/waybills', {
+      waybill_no: badWaybillNo,
+      meat_type: '冷鲜牛肉',
+      zone_code: 'CHILLED'
+    });
+    assert('严重违规运单创建成功', r.status === 201 && r.body.code === 0);
+
+    r = await httpRequest('POST', '/api/segments/batch', {
+      segments: [
+        { waybill_no: badWaybillNo, start_time: '2026-06-21T08:00:00', end_time: '2026-06-21T09:00:00',
+          avg_temp: 8, min_temp: 6, max_temp: 10, location_name: '在途', door_open: 0, cooler_status: 'error' },
+        { waybill_no: badWaybillNo, start_time: '2026-06-21T09:00:00', end_time: '2026-06-21T10:00:00',
+          avg_temp: 9, min_temp: 7, max_temp: 11, location_name: '在途', door_open: 1, door_open_duration: 600, cooler_status: 'error' },
+        { waybill_no: badWaybillNo, start_time: '2026-06-21T10:00:00', end_time: '2026-06-21T11:00:00',
+          avg_temp: 12, min_temp: 10, max_temp: 14, location_name: '在途', door_open: 1, door_open_duration: 900, cooler_status: 'error' },
+        { waybill_no: badWaybillNo, start_time: '2026-06-21T11:00:00', end_time: '2026-06-21T12:00:00',
+          avg_temp: 2, min_temp: 0, max_temp: 4, location_name: '在途', door_open: 0, cooler_status: 'normal' }
+      ]
+    });
+    assert('严重违规片段上传成功', r.status === 200 && r.body.data.success === 4);
+
+    r = await httpRequest('GET', '/api/summary/waybill/' + badWaybillNo);
+    assert('严重违规摘要查询成功', r.status === 200 && r.body.code === 0);
+    const badSummary = r.body.data;
+    assert('违规次数>=3触发拒收', badSummary.signoff_risk.level === 'rejection_recommended',
+      '实际=' + badSummary.signoff_risk.level + ' 违规数=' + badSummary.status_counts.violation);
+    assert('拒收标签正确', badSummary.signoff_risk.label === '建议拒收');
+    assert('风险因素包含多个项', badSummary.signoff_risk.factors.length >= 2);
+    assert('affects_signoff 为 true', badSummary.affects_signoff === true);
+    assert('signoff_note 包含拒收', badSummary.signoff_note.includes('拒收'));
+
+    console.log('\n[20] 运输阶段分布 - 自动归类');
+    const stageWaybillNo = 'TEST-STAGE-001';
+    r = await httpRequest('POST', '/api/waybills', {
+      waybill_no: stageWaybillNo,
+      meat_type: '冻猪肉',
+      zone_code: 'FROZEN'
+    });
+    assert('阶段测试运单创建成功', r.status === 201 && r.body.code === 0);
+
+    r = await httpRequest('POST', '/api/segments/batch', {
+      segments: [
+        { waybill_no: stageWaybillNo, start_time: '2026-06-21T08:00:00', end_time: '2026-06-21T10:00:00',
+          avg_temp: -20, min_temp: -22, max_temp: -18, sample_count: 60,
+          location_name: '京港澳高速路段', door_open: 0, cooler_status: 'normal' },
+        { waybill_no: stageWaybillNo, start_time: '2026-06-21T10:00:00', end_time: '2026-06-21T10:30:00',
+          avg_temp: -19, min_temp: -21, max_temp: -17, sample_count: 30,
+          location_name: '保定服务区', door_open: 0, cooler_status: 'idle' },
+        { waybill_no: stageWaybillNo, start_time: '2026-06-21T10:30:00', end_time: '2026-06-21T12:00:00',
+          avg_temp: -8, min_temp: -12, max_temp: -2, sample_count: 90,
+          location_name: '北京冷库卸货', door_open: 1, door_open_duration: 5400, cooler_status: 'normal' }
+      ]
+    });
+    assert('阶段测试片段上传成功', r.status === 200 && r.body.data.success === 3);
+
+    r = await httpRequest('GET', '/api/summary/waybill/' + stageWaybillNo);
+    assert('阶段测试摘要查询成功', r.status === 200 && r.body.code === 0);
+    const stageSummary = r.body.data;
+    assert('摘要含 stage_breakdown', stageSummary.stage_breakdown != null);
+    assert('stage_breakdown 含 in_transit', stageSummary.stage_breakdown.in_transit != null);
+    assert('stage_breakdown 含 stop', stageSummary.stage_breakdown.stop != null);
+    assert('stage_breakdown 含 loading_unloading', stageSummary.stage_breakdown.loading_unloading != null);
+    assert('在途阶段有片段', stageSummary.stage_breakdown.in_transit.segment_count >= 1);
+    assert('装卸阶段有开门记录', stageSummary.stage_breakdown.loading_unloading.door_incidents >= 1);
+
+    console.log('\n[21] 运输阶段 - 显式传transport_stage字段');
+    const explicitStageWaybill = 'TEST-STAGE-EXP-001';
+    r = await httpRequest('POST', '/api/waybills', {
+      waybill_no: explicitStageWaybill, meat_type: '冻牛肉', zone_code: 'FROZEN'
+    });
+    assert('显式阶段运单创建成功', r.status === 201 && r.body.code === 0);
+
+    r = await httpRequest('POST', '/api/segments', {
+      waybill_no: explicitStageWaybill,
+      start_time: '2026-06-22T08:00:00', end_time: '2026-06-22T09:00:00',
+      avg_temp: -20, min_temp: -22, max_temp: -18,
+      location_name: '测试地点',
+      transport_stage: 'loading_unloading',
+      door_open: 0, cooler_status: 'normal'
+    });
+    assert('显式阶段片段上传成功', r.status === 201 && r.body.code === 0);
+    assert('稽核结果含 transport_stage 字段', r.body.data.audit.transport_stage === 'loading_unloading',
+      '实际=' + r.body.data.audit.transport_stage);
+
+    console.log('\n[22] 多视角证据 - 内部版 vs 客户版');
+    r = await httpRequest('POST', '/api/evidence/' + badWaybillNo, { dispute_type: 'customer_complaint', audience: 'internal' });
+    assert('内部版证据生成成功', r.status === 200 && r.body.code === 0);
+    const internalEvidence = r.body.data;
+    assert('内部版 audience=internal', internalEvidence.audience === 'internal');
+    assert('内部版含完整时间线', Array.isArray(internalEvidence.timeline) && internalEvidence.timeline.length > 0);
+    assert('内部版含违规片段明细', Array.isArray(internalEvidence.temperature_analysis.violation_segments) && internalEvidence.temperature_analysis.violation_segments.length > 0);
+    assert('内部版含时段分布', internalEvidence.summary.period_breakdown != null);
+    assert('内部版含阶段分布', internalEvidence.summary.stage_breakdown != null);
+    assert('内部版文本含数据统计章节', internalEvidence.text_conclusion.includes('数据统计'));
+    assert('内部版文本含时段异常分布', internalEvidence.text_conclusion.includes('时段异常分布'));
+    assert('内部版文本含运输阶段分布', internalEvidence.text_conclusion.includes('运输阶段异常分布'));
+
+    r = await httpRequest('POST', '/api/evidence/' + badWaybillNo, { dispute_type: 'customer_complaint', audience: 'customer' });
+    assert('客户版证据生成成功', r.status === 200 && r.body.code === 0);
+    const customerEvidence = r.body.data;
+    assert('客户版 audience=customer', customerEvidence.audience === 'customer');
+    assert('客户版时间线为空', Array.isArray(customerEvidence.timeline) && customerEvidence.timeline.length === 0);
+    assert('客户版违规片段为空', Array.isArray(customerEvidence.temperature_analysis.violation_segments) && customerEvidence.temperature_analysis.violation_segments.length === 0);
+    assert('客户版文本不含数据统计章节', !customerEvidence.text_conclusion.includes('数据统计'));
+    assert('客户版文本标题含客户版', customerEvidence.text_conclusion.includes('客户版'));
+
+    r = await httpRequest('POST', '/api/evidence/' + badWaybillNo, { audience: 'invalid' });
+    assert('非法audience返回400', r.status === 400);
+
+    console.log('\n[23] 稽核结果筛选 - 按状态筛选');
+    r = await httpRequest('GET', '/api/audits/waybill/' + badWaybillNo + '?status=violation');
+    assert('按violation筛选成功', r.status === 200 && r.body.code === 0);
+    const violationOnly = r.body.data;
+    assert('只返回violation状态记录', violationOnly.length > 0 && violationOnly.every(function(a) { return a.status === 'violation'; }),
+      '数量=' + violationOnly.length);
+
+    r = await httpRequest('GET', '/api/audits/waybill/' + badWaybillNo + '?status=violation&status=manual_review');
+    assert('多状态筛选成功', r.status === 200 && r.body.code === 0);
+    const multiStatus = r.body.data;
+    assert('多状态筛选数量>=单状态', multiStatus.length >= violationOnly.length);
+
+    r = await httpRequest('GET', '/api/audits/waybill/' + badWaybillNo + '?status=normal');
+    assert('按normal筛选返回正常片段', r.status === 200 && r.body.code === 0);
+    assert('只返回normal状态', r.body.data.every(function(a) { return a.status === 'normal'; }));
+
+    console.log('\n[24] 稽核结果筛选 - 按时间范围筛选');
+    r = await httpRequest('GET', '/api/audits/waybill/' + badWaybillNo + '?start_time=2026-06-21T08:30:00&end_time=2026-06-21T10:30:00');
+    assert('时间范围筛选成功', r.status === 200 && r.body.code === 0);
+    const timeFiltered = r.body.data;
+    assert('时间范围内片段数正确', timeFiltered.length >= 2 && timeFiltered.length <= 3, '实际=' + timeFiltered.length);
+    assert('返回的filters信息正确', r.body.filters && r.body.filters.start_time != null);
+
+    r = await httpRequest('GET', '/api/audits/waybill/' + badWaybillNo + '?status=violation&start_time=2026-06-21T08:00:00&end_time=2026-06-21T11:00:00');
+    assert('状态+时间联合筛选成功', r.status === 200 && r.body.code === 0);
+    const combinedFilter = r.body.data;
+    assert('联合筛选结果均为violation', combinedFilter.every(function(a) { return a.status === 'violation'; }));
+
   } catch (e) {
     console.error('\u6d4b\u8bd5\u8fd0\u884c\u51fa\u9519:', e);
     failed++;

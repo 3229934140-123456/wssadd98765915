@@ -203,12 +203,23 @@ async function createApp() {
       if (!waybillRepo.getByNo(req.params.waybillNo)) {
         return res.status(404).json({ code: 404, error: '运单不存在' });
       }
-      const audits = auditRepo.getByWaybill(req.params.waybillNo);
+      const filterOptions = {};
+      if (req.query.status) {
+        const statusList = Array.isArray(req.query.status) ? req.query.status : [req.query.status];
+        filterOptions.status = statusList.filter(Boolean);
+      }
+      if (req.query.start_time) {
+        filterOptions.start_time = req.query.start_time;
+      }
+      if (req.query.end_time) {
+        filterOptions.end_time = req.query.end_time;
+      }
+      const audits = auditRepo.getByWaybillFiltered(req.params.waybillNo, filterOptions);
       const enriched = audits.map(function(a) {
         const d = a.details ? JSON.parse(a.details) : null;
         return Object.assign({}, a, { details: d });
       });
-      res.json({ code: 0, data: enriched });
+      res.json({ code: 0, data: enriched, filters: filterOptions });
     } catch (e) {
       res.status(500).json({ code: 500, error: e.message });
     }
@@ -228,8 +239,13 @@ async function createApp() {
 
   app.post('/api/evidence/:waybillNo', function(req, res) {
     try {
-      const disputeType = (req.body && req.body.dispute_type) || 'customer_complaint';
-      const evidence = generateEvidence(req.params.waybillNo, disputeType);
+      const opts = {};
+      opts.dispute_type = (req.body && req.body.dispute_type) || 'customer_complaint';
+      opts.audience = (req.body && req.body.audience) || 'internal';
+      if (['internal', 'customer'].indexOf(opts.audience) < 0) {
+        return res.status(400).json({ code: 400, error: 'audience 必须是 internal 或 customer' });
+      }
+      const evidence = generateEvidence(req.params.waybillNo, opts);
       if (!evidence) {
         return res.status(404).json({ code: 404, error: '运单不存在' });
       }

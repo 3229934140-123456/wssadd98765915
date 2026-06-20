@@ -31,8 +31,49 @@ const COOLER_STATUS_ENUM = {
   ERROR: 'error'
 };
 
+const TRANSPORT_STAGE = {
+  IN_TRANSIT: 'in_transit',
+  STOP: 'stop',
+  LOADING_UNLOADING: 'loading_unloading',
+  UNKNOWN: 'unknown'
+};
+
+const SIGNOFF_RISK_LEVEL = {
+  SUGGEST_SIGNOFF: 'suggest_signoff',
+  REVIEW_REQUIRED: 'review_required',
+  REJECTION_RECOMMENDED: 'rejection_recommended'
+};
+
 function minutesBetween(startStr, endStr) {
   return moment(endStr).diff(moment(startStr), 'minutes');
+}
+
+function classifyTransportStage(segment) {
+  if (segment.transport_stage && config.transportStages[segment.transport_stage]) {
+    return segment.transport_stage;
+  }
+
+  const locName = (segment.location_name || '').toLowerCase();
+  const doorOpen = !!segment.door_open;
+
+  const stageKeys = Object.keys(config.transportStages);
+  for (const key of stageKeys) {
+    const kws = config.transportStages[key].keywords || [];
+    for (const kw of kws) {
+      if (locName.indexOf(kw) >= 0) {
+        if (key === 'loading_unloading' && !doorOpen && segment.door_open_duration === 0) {
+          return 'stop';
+        }
+        return key;
+      }
+    }
+  }
+
+  if (doorOpen && (segment.door_open_duration || 0) >= 60) {
+    return TRANSPORT_STAGE.LOADING_UNLOADING;
+  }
+
+  return TRANSPORT_STAGE.UNKNOWN;
 }
 
 function evaluateTemperature(segment, zoneConfig) {
@@ -123,6 +164,7 @@ function auditSegment(segment, zoneConfig) {
   const tempResult = evaluateTemperature(segment, zoneConfig);
   const doorResult = evaluateDoor(segment);
   const coolerResult = evaluateCooler(segment);
+  const stage = classifyTransportStage(segment);
 
   let finalStatus;
   const totalScore = tempResult.scoreImpact + doorResult.scoreImpact + coolerResult.scoreImpact;
@@ -169,6 +211,7 @@ function auditSegment(segment, zoneConfig) {
       status: coolerResult.coolerResult,
       raw: segment.cooler_status
     },
+    transport_stage: stage,
     duration_minutes: tempResult.duration
   };
 
@@ -179,6 +222,7 @@ function auditSegment(segment, zoneConfig) {
     temp_status: tempResult.tempStatus,
     door_status: doorResult.doorStatus,
     cooler_status: coolerResult.coolerResult,
+    transport_stage: stage,
     details: JSON.stringify(details)
   };
 }
@@ -205,6 +249,66 @@ function getTimePeriod(timeStr) {
   if (hour >= periods.afternoon.start && hour < periods.afternoon.end) return 'afternoon';
   if (hour >= periods.evening.start && hour < periods.evening.end) return 'evening';
   return 'unknown';
+}
+
+function evaluateSignoffRisk(summary) {
+  const riskConfig = config.signoffRisk;
+  const counts = summary.status_counts;
+  const tempV = summary.temp_violations;
+  const doorV = summary.door_incidents;
+  const coolerV = summary.cooler_incidents;
+  const factors = [];
+  let level = SIGNOFF_RISK_LEVEL.SUGGEST_SIGNOFF;
+
+  if (counts.violation >= riskConfig.rejectionThreshold.violationCount) {
+    level = SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED;
+    factors.push('违规片段累计 ' + counts.violation + ' 次，已超拒收阈值');
+  }
+  if (tempV.total_duration_minutes >= riskConfig.rejectionThreshold.totalViolationMinutes) {
+    level = SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED;
+    factors.push('累计超温 ' + tempV.total_duration_minutes + ' 分钟，已超拒收阈值');
+  }
+  if (tempV.peak_violation_count > 0 && riskConfig.rejectionThreshold.hasPeakViolation) {
+    if (level !== SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED) level = SIGNOFF_RISK_LEVEL.REVIEW_REQUIRED;
+    factors.push('存在瞬时严重超温 ' + tempV.peak_violation_count + ' 次（峰值超温区上限 4℃）');
+  }
+  if (coolerV.error_count > 0 && riskConfig.rejectionThreshold.hasCoolerError) {
+    if (level !== SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED) level = SIGNOFF_RISK_LEVEL.REVIEW_REQUIRED;
+    factors.push('制冷机故障 ' + coolerV.error_count + ' 次，存在设备异常风险');
+  }
+  if (doorV.count >= riskConfig.rejectionThreshold.doorViolationCount) {
+    if (level !== SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED) level = SIGNOFF_RISK_LEVEL.REVIEW_REQUIRED;
+    factors.push('开门异常 ' + doorV.count + ' 次，可能影响冷链稳定性');
+  }
+  if (counts.manual_review > 0) {
+    level = SIGNOFF_RISK_LEVEL.REVIEW_REQUIRED;
+    factors.push('存在 ' + counts.manual_review + ' 条待人工复核记录');
+  }
+  if (counts.warning > 0 && level === SIGNOFF_RISK_LEVEL.SUGGEST_SIGNOFF) {
+    level = SIGNOFF_RISK_LEVEL.REVIEW_REQUIRED;
+    factors.push('存在 ' + counts.warning + ' 次预警，建议关注');
+  }
+
+  if (factors.length === 0) {
+    factors.push('全程冷链数据正常，无异常');
+  }
+
+  return {
+    level: level,
+    label: riskConfig.labels[level],
+    factors: factors,
+    signoff_note: buildSignoffNote(level, factors)
+  };
+}
+
+function buildSignoffNote(level, factors) {
+  if (level === SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED) {
+    return '冷链数据存在严重异常，建议拒收；如已签收请立即评估产品质量，必要时抽样检测。';
+  }
+  if (level === SIGNOFF_RISK_LEVEL.REVIEW_REQUIRED) {
+    return '冷链数据存在异常项，建议与承运方核实原因并确认产品质量后再签收。';
+  }
+  return '冷链数据正常，可正常签收。';
 }
 
 function summarizeWaybillAudit(waybillNo) {
@@ -247,6 +351,12 @@ function summarizeWaybillAudit(waybillNo) {
       afternoon: { label: config.timePeriods.afternoon.label, temp_violations: 0, peak_violations: 0, door_incidents: 0, segment_count: 0 },
       evening: { label: config.timePeriods.evening.label, temp_violations: 0, peak_violations: 0, door_incidents: 0, segment_count: 0 }
     },
+    stage_breakdown: {
+      in_transit: { label: config.transportStages.in_transit.label, temp_violations: 0, peak_violations: 0, door_incidents: 0, segment_count: 0 },
+      stop: { label: config.transportStages.stop.label, temp_violations: 0, peak_violations: 0, door_incidents: 0, segment_count: 0 },
+      loading_unloading: { label: config.transportStages.loading_unloading.label, temp_violations: 0, peak_violations: 0, door_incidents: 0, segment_count: 0 },
+      unknown: { label: '未知', temp_violations: 0, peak_violations: 0, door_incidents: 0, segment_count: 0 }
+    },
     overall_status: AUDIT_STATUS.NORMAL,
     affects_signoff: false,
     signoff_note: ''
@@ -261,8 +371,13 @@ function summarizeWaybillAudit(waybillNo) {
 
     const duration = minutesBetween(a.start_time, a.end_time);
     const period = getTimePeriod(a.start_time);
+    const stage = a.transport_stage || 'unknown';
+
     if (summary.period_breakdown[period]) {
       summary.period_breakdown[period].segment_count++;
+    }
+    if (summary.stage_breakdown[stage]) {
+      summary.stage_breakdown[stage].segment_count++;
     }
 
     const isTempViolation = a.temp_status && (a.temp_status.startsWith('violation') || a.temp_status.startsWith('peak_violation'));
@@ -276,6 +391,9 @@ function summarizeWaybillAudit(waybillNo) {
       if (summary.period_breakdown[period]) {
         summary.period_breakdown[period].temp_violations++;
       }
+      if (summary.stage_breakdown[stage]) {
+        summary.stage_breakdown[stage].temp_violations++;
+      }
     } else {
       if (inViolationRun) {
         longestViolation = Math.max(longestViolation, currentViolationMinutes);
@@ -288,6 +406,9 @@ function summarizeWaybillAudit(waybillNo) {
       summary.temp_violations.peak_violation_count++;
       if (summary.period_breakdown[period]) {
         summary.period_breakdown[period].peak_violations++;
+      }
+      if (summary.stage_breakdown[stage]) {
+        summary.stage_breakdown[stage].peak_violations++;
       }
     }
 
@@ -308,6 +429,9 @@ function summarizeWaybillAudit(waybillNo) {
       if (summary.period_breakdown[period]) {
         summary.period_breakdown[period].door_incidents++;
       }
+      if (summary.stage_breakdown[stage]) {
+        summary.stage_breakdown[stage].door_incidents++;
+      }
     }
 
     if (a.cooler_status === COOLER_STATUS_ENUM.WARNING) summary.cooler_incidents.warning_count++;
@@ -327,17 +451,14 @@ function summarizeWaybillAudit(waybillNo) {
     summary.overall_status = AUDIT_STATUS.WARNING;
   }
 
-  const totalViolationMin = summary.temp_violations.total_duration_minutes;
-  const hasSeriousViolation = counts.violation > 0;
-  const tooMuchViolation = totalViolationMin >= config.audit.totalViolationMinMinutes;
-  const longSingleViolation = summary.temp_violations.longest_duration_minutes >= config.audit.singleViolationMinMinutes * 2;
-  const coolerError = summary.cooler_incidents.error_count > 0;
-  const hasPeakViolation = summary.temp_violations.peak_violation_count > 0;
-
-  summary.affects_signoff = hasSeriousViolation && (tooMuchViolation || longSingleViolation || coolerError || hasPeakViolation);
-  summary.signoff_note = summary.affects_signoff
-    ? '冷链数据存在严重异常，建议拒收或需与承运方确认质量确认后签收'
-    : '冷链数据正常或轻微异常，可正常签收';
+  const risk = evaluateSignoffRisk(summary);
+  summary.signoff_risk = {
+    level: risk.level,
+    label: risk.label,
+    factors: risk.factors
+  };
+  summary.affects_signoff = risk.level === SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED;
+  summary.signoff_note = risk.signoff_note;
 
   return summary;
 }
@@ -389,8 +510,11 @@ function generateConclusion(summary, waybill, zoneConfig) {
 
 function generateRecommendations(summary) {
   const recs = [];
-  if (summary.affects_signoff) {
-    recs.push('建议与承运方进行质量确认后再决定是否签收，必要时抽样检测。');
+  const risk = summary.signoff_risk;
+  if (risk && risk.level === SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED) {
+    recs.push('建议拒收，如已签收请立即评估产品质量，必要时抽样检测。');
+  } else if (risk && risk.level === SIGNOFF_RISK_LEVEL.REVIEW_REQUIRED) {
+    recs.push('建议与承运方核实异常原因，确认产品质量后再签收。');
   } else {
     recs.push('可正常签收。');
   }
@@ -412,42 +536,72 @@ function generateRecommendations(summary) {
   return recs;
 }
 
-function generateTextConclusion(summary, waybill, zoneConfig, audits) {
+function generateTextConclusion(summary, waybill, zoneConfig, audits, audience) {
+  const aud = audience || 'internal';
+  const isInternal = aud === 'internal';
   const lines = [];
-  lines.push('【冷链温区稽核报告 - 文本版】');
+
+  if (isInternal) {
+    lines.push('【冷链温区稽核报告 - 内部版】');
+  } else {
+    lines.push('【冷链温区稽核报告 - 客户版】');
+  }
   lines.push('');
   lines.push('运单编号：' + waybill.waybill_no);
   lines.push('货物类型：' + waybill.meat_type);
   lines.push('温区要求：' + zoneConfig.zone_name + '（' + zoneConfig.min_temp + '℃ ~ ' + zoneConfig.max_temp + '℃）');
   if (waybill.origin) lines.push('始发地：' + waybill.origin);
   if (waybill.destination) lines.push('目的地：' + waybill.destination);
-  if (waybill.planned_departure) lines.push('计划发车：' + waybill.planned_departure);
-  if (waybill.planned_arrival) lines.push('计划到达：' + waybill.planned_arrival);
   lines.push('');
+
   lines.push('--- 稽核结论 ---');
-  lines.push(generateConclusion(summary, waybill, zoneConfig));
+  if (isInternal) {
+    lines.push(generateConclusion(summary, waybill, zoneConfig));
+  } else {
+    lines.push('本批次货物冷链运输已完成温区稽核，结果如下。');
+  }
   lines.push('综合状态：' + summary.overall_status);
-  lines.push('是否影响签收：' + (summary.affects_signoff ? '是' : '否'));
-  lines.push('');
-
-  lines.push('--- 数据统计 ---');
-  lines.push('监测片段数：' + summary.segment_count);
-  lines.push('正常：' + summary.status_counts.normal + '  预警：' + summary.status_counts.warning + '  违规：' + summary.status_counts.violation + '  待复核：' + summary.status_counts.manual_review);
-  if (summary.temp_violations.max_temp_peak != null) lines.push('温度峰值：' + summary.temp_violations.max_temp_peak + '℃');
-  if (summary.temp_violations.min_temp_trough != null) lines.push('温度谷值：' + summary.temp_violations.min_temp_trough + '℃');
-  if (summary.temp_violations.peak_violation_count > 0) lines.push('瞬时严重超温次数：' + summary.temp_violations.peak_violation_count);
-  if (summary.door_incidents.count > 0) lines.push('开门异常：' + summary.door_incidents.count + '次，累计' + summary.door_incidents.total_open_minutes + '分钟');
-  if (summary.cooler_incidents.error_count > 0) lines.push('制冷机故障：' + summary.cooler_incidents.error_count + '次');
-  lines.push('');
-
-  lines.push('--- 时段异常分布 ---');
-  for (const key of Object.keys(summary.period_breakdown)) {
-    const p = summary.period_breakdown[key];
-    if (p.segment_count > 0) {
-      lines.push(p.label + '：超温' + p.temp_violations + '次(含瞬时严重' + p.peak_violations + '次)，开门异常' + p.door_incidents + '次');
+  if (summary.signoff_risk) {
+    lines.push('签收建议：' + summary.signoff_risk.label);
+    if (isInternal) {
+      lines.push('风险因素：' + summary.signoff_risk.factors.join('；'));
+    } else {
+      lines.push('签收说明：' + summary.signoff_note);
     }
   }
   lines.push('');
+
+  if (isInternal) {
+    lines.push('--- 数据统计 ---');
+    lines.push('监测片段数：' + summary.segment_count);
+    lines.push('正常：' + summary.status_counts.normal + '  预警：' + summary.status_counts.warning + '  违规：' + summary.status_counts.violation + '  待复核：' + summary.status_counts.manual_review);
+    if (summary.temp_violations.max_temp_peak != null) lines.push('温度峰值：' + summary.temp_violations.max_temp_peak + '℃');
+    if (summary.temp_violations.min_temp_trough != null) lines.push('温度谷值：' + summary.temp_violations.min_temp_trough + '℃');
+    if (summary.temp_violations.peak_violation_count > 0) lines.push('瞬时严重超温次数：' + summary.temp_violations.peak_violation_count);
+    if (summary.door_incidents.count > 0) lines.push('开门异常：' + summary.door_incidents.count + '次，累计' + summary.door_incidents.total_open_minutes + '分钟');
+    if (summary.cooler_incidents.error_count > 0) lines.push('制冷机故障：' + summary.cooler_incidents.error_count + '次');
+    lines.push('');
+  }
+
+  if (isInternal) {
+    lines.push('--- 时段异常分布 ---');
+    for (const key of Object.keys(summary.period_breakdown)) {
+      const p = summary.period_breakdown[key];
+      if (p.segment_count > 0) {
+        lines.push(p.label + '：片段' + p.segment_count + '个，超温' + p.temp_violations + '次(含瞬时严重' + p.peak_violations + '次)，开门异常' + p.door_incidents + '次');
+      }
+    }
+    lines.push('');
+
+    lines.push('--- 运输阶段异常分布 ---');
+    for (const key of Object.keys(summary.stage_breakdown)) {
+      const s = summary.stage_breakdown[key];
+      if (s.segment_count > 0) {
+        lines.push(s.label + '：片段' + s.segment_count + '个，超温' + s.temp_violations + '次(含瞬时严重' + s.peak_violations + '次)，开门异常' + s.door_incidents + '次');
+      }
+    }
+    lines.push('');
+  }
 
   lines.push('--- 关键异常时间线 ---');
   const abnormalAudits = audits.filter(function(a) {
@@ -456,7 +610,8 @@ function generateTextConclusion(summary, waybill, zoneConfig, audits) {
   if (abnormalAudits.length === 0) {
     lines.push('全程无异常。');
   } else {
-    for (const a of abnormalAudits) {
+    const displayAudits = isInternal ? abnormalAudits : abnormalAudits.slice(0, 5);
+    for (const a of displayAudits) {
       const timeRange = a.start_time + ' ~ ' + a.end_time;
       const parts = [];
       parts.push('[' + a.status.toUpperCase() + ']');
@@ -465,22 +620,35 @@ function generateTextConclusion(summary, waybill, zoneConfig, audits) {
       if (a.location_name) parts.push('@' + a.location_name);
       lines.push(parts.join('  '));
     }
+    if (!isInternal && abnormalAudits.length > 5) {
+      lines.push('... 共' + abnormalAudits.length + '条异常，如需详细记录请联系客服。');
+    }
   }
   lines.push('');
 
   lines.push('--- 处理建议 ---');
   const recs = generateRecommendations(summary);
-  for (let i = 0; i < recs.length; i++) {
-    lines.push((i + 1) + '. ' + recs[i]);
+  if (isInternal) {
+    for (let i = 0; i < recs.length; i++) {
+      lines.push((i + 1) + '. ' + recs[i]);
+    }
+  } else {
+    lines.push(recs[0]);
+    if (recs.length > 1) {
+      lines.push('如有疑问请联系我方客服进一步核实。');
+    }
   }
   lines.push('');
+
   lines.push('报告生成时间：' + new Date().toISOString());
 
   return lines.join('\n');
 }
 
-function generateEvidence(waybillNo, disputeType) {
-  const dispute = disputeType || 'customer_complaint';
+function generateEvidence(waybillNo, options) {
+  const opts = options || {};
+  const dispute = opts.dispute_type || 'customer_complaint';
+  const audience = opts.audience || 'internal';
   const waybill = waybillRepo.getByNo(waybillNo);
   if (!waybill) return null;
 
@@ -497,7 +665,8 @@ function generateEvidence(waybillNo, disputeType) {
       temp_avg: a.avg_temp,
       location: a.location_name,
       door_open: a.door_open,
-      cooler: a.segment_cooler_status
+      cooler: a.segment_cooler_status,
+      transport_stage: a.transport_stage
     };
   });
 
@@ -510,7 +679,8 @@ function generateEvidence(waybillNo, disputeType) {
         duration_minutes: minutesBetween(a.start_time, a.end_time),
         location: a.location_name,
         open_duration_seconds: a.door_open_duration,
-        avg_temp: a.avg_temp
+        avg_temp: a.avg_temp,
+        transport_stage: a.transport_stage
       };
     });
 
@@ -530,16 +700,18 @@ function generateEvidence(waybillNo, disputeType) {
         avg_temp: a.avg_temp,
         max_temp: a.max_temp,
         min_temp: a.min_temp,
-        location: a.location_name
+        location: a.location_name,
+        transport_stage: a.transport_stage
       };
     });
 
-  const textConclusion = generateTextConclusion(summary, waybill, zoneConfig, audits);
+  const textConclusion = generateTextConclusion(summary, waybill, zoneConfig, audits, audience);
 
-  return {
+  const evidence = {
     evidence_id: 'EVIDENCE_' + waybillNo + '_' + Date.now(),
     generated_at: new Date().toISOString(),
     dispute_type: dispute,
+    audience: audience,
     waybill: {
       waybill_no: waybillNo,
       meat_type: waybill.meat_type,
@@ -561,7 +733,9 @@ function generateEvidence(waybillNo, disputeType) {
       total_segments: summary.segment_count,
       status_counts: summary.status_counts,
       affects_signoff: summary.affects_signoff,
-      period_breakdown: summary.period_breakdown
+      signoff_risk: summary.signoff_risk,
+      period_breakdown: summary.period_breakdown,
+      stage_breakdown: summary.stage_breakdown
     },
     temperature_analysis: {
       peak_temp: summary.temp_violations.max_temp_peak,
@@ -592,6 +766,20 @@ function generateEvidence(waybillNo, disputeType) {
     text_conclusion: textConclusion,
     recommendations: generateRecommendations(summary)
   };
+
+  if (audience === 'customer') {
+    delete evidence.temperature_analysis.violation_segments;
+    delete evidence.door_records.incidents;
+    delete evidence.timeline;
+    delete evidence.location_stops;
+    delete evidence.summary.period_breakdown;
+    delete evidence.summary.stage_breakdown;
+    evidence.temperature_analysis.violation_segments = [];
+    evidence.door_records.incidents = [];
+    evidence.timeline = [];
+  }
+
+  return evidence;
 }
 
 module.exports = {
@@ -599,9 +787,13 @@ module.exports = {
   TEMP_STATUS,
   DOOR_STATUS,
   COOLER_STATUS_ENUM,
+  TRANSPORT_STAGE,
+  SIGNOFF_RISK_LEVEL,
   auditSegment,
   processSegmentAudit,
   summarizeWaybillAudit,
   generateEvidence,
-  getTimePeriod
+  getTimePeriod,
+  classifyTransportStage,
+  evaluateSignoffRisk
 };

@@ -84,6 +84,7 @@ function createTables() {
       door_open INTEGER DEFAULT 0,
       door_open_duration INTEGER DEFAULT 0,
       cooler_status TEXT DEFAULT 'normal',
+      transport_stage TEXT,
       device_id TEXT,
       raw_payload TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -97,6 +98,7 @@ function createTables() {
       temp_status TEXT,
       door_status TEXT,
       cooler_status TEXT,
+      transport_stage TEXT,
       details TEXT,
       audit_time DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -253,13 +255,14 @@ const segmentRepo = {
   create: function(data) {
     const sql = `
       INSERT INTO temperature_segments (waybill_no, start_time, end_time, avg_temp, min_temp, max_temp, sample_count,
-        location_lat, location_lng, location_name, door_open, door_open_duration, cooler_status, device_id, raw_payload)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        location_lat, location_lng, location_name, door_open, door_open_duration, cooler_status, transport_stage, device_id, raw_payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
     const id = run(sql, [data.waybill_no, data.start_time, data.end_time, data.avg_temp, data.min_temp, data.max_temp,
       data.sample_count || 1, data.location_lat != null ? data.location_lat : null,
       data.location_lng != null ? data.location_lng : null, data.location_name || null,
       data.door_open ? 1 : 0, data.door_open_duration || 0, data.cooler_status || 'normal',
+      data.transport_stage || null,
       data.device_id || null, data.raw_payload || null]);
     return segmentRepo.getById(id);
   },
@@ -279,11 +282,11 @@ const segmentRepo = {
 const auditRepo = {
   create: function(data) {
     const sql = `
-      INSERT INTO audit_results (segment_id, waybill_no, status, temp_status, door_status, cooler_status, details)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO audit_results (segment_id, waybill_no, status, temp_status, door_status, cooler_status, transport_stage, details)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `;
     const id = run(sql, [data.segment_id, data.waybill_no, data.status, data.temp_status || null,
-      data.door_status || null, data.cooler_status || null, data.details || null]);
+      data.door_status || null, data.cooler_status || null, data.transport_stage || null, data.details || null]);
     return auditRepo.getById(id);
   },
   getById: function(id) {
@@ -295,22 +298,54 @@ const auditRepo = {
   getByWaybill: function(waybillNo) {
     return all(`
       SELECT ar.*, ts.start_time, ts.end_time, ts.avg_temp, ts.max_temp, ts.min_temp, ts.location_name,
-             ts.door_open, ts.door_open_duration, ts.cooler_status as segment_cooler_status
+             ts.door_open, ts.door_open_duration, ts.cooler_status as segment_cooler_status,
+             ts.transport_stage as segment_transport_stage
       FROM audit_results ar
       JOIN temperature_segments ts ON ar.segment_id = ts.id
       WHERE ar.waybill_no = ? ORDER BY ts.start_time ASC
     `, [waybillNo]);
+  },
+  getByWaybillFiltered: function(waybillNo, options) {
+    const opts = options || {};
+    const params = [waybillNo];
+    let whereSql = 'WHERE ar.waybill_no = ?';
+
+    if (opts.status && Array.isArray(opts.status) && opts.status.length > 0) {
+      const placeholders = opts.status.map(function() { return '?'; }).join(',');
+      whereSql += ' AND ar.status IN (' + placeholders + ')';
+      for (const s of opts.status) { params.push(s); }
+    }
+
+    if (opts.start_time) {
+      whereSql += ' AND ts.end_time >= ?';
+      params.push(opts.start_time);
+    }
+    if (opts.end_time) {
+      whereSql += ' AND ts.start_time <= ?';
+      params.push(opts.end_time);
+    }
+
+    const sql = `
+      SELECT ar.*, ts.start_time, ts.end_time, ts.avg_temp, ts.max_temp, ts.min_temp, ts.location_name,
+             ts.door_open, ts.door_open_duration, ts.cooler_status as segment_cooler_status,
+             ts.transport_stage as segment_transport_stage
+      FROM audit_results ar
+      JOIN temperature_segments ts ON ar.segment_id = ts.id
+      ${whereSql}
+      ORDER BY ts.start_time ASC
+    `;
+    return all(sql, params);
   },
   upsert: function(data) {
     const existing = auditRepo.getBySegmentId(data.segment_id);
     if (existing) {
       const sql = `
         UPDATE audit_results SET status = ?, temp_status = ?, door_status = ?,
-          cooler_status = ?, details = ?, audit_time = CURRENT_TIMESTAMP
+          cooler_status = ?, transport_stage = ?, details = ?, audit_time = CURRENT_TIMESTAMP
         WHERE segment_id = ?
       `;
       run(sql, [data.status, data.temp_status || null, data.door_status || null,
-        data.cooler_status || null, data.details || null, data.segment_id]);
+        data.cooler_status || null, data.transport_stage || null, data.details || null, data.segment_id]);
       return auditRepo.getBySegmentId(data.segment_id);
     }
     return auditRepo.create(data);
