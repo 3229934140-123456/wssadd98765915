@@ -44,6 +44,13 @@ const SIGNOFF_RISK_LEVEL = {
   REJECTION_RECOMMENDED: 'rejection_recommended'
 };
 
+const RESPONSIBILITY = {
+  CARRIER: 'carrier',
+  EQUIPMENT: 'equipment',
+  LOADING: 'loading',
+  JOINT_REVIEW: 'joint_review'
+};
+
 function minutesBetween(startStr, endStr) {
   return moment(endStr).diff(moment(startStr), 'minutes');
 }
@@ -311,6 +318,160 @@ function buildSignoffNote(level, factors) {
   return '冷链数据正常，可正常签收。';
 }
 
+function evaluateResponsibilityTendency(summary, audits) {
+  const respConfig = config.responsibility;
+  const scores = {};
+  scores[RESPONSIBILITY.CARRIER] = 0;
+  scores[RESPONSIBILITY.EQUIPMENT] = 0;
+  scores[RESPONSIBILITY.LOADING] = 0;
+
+  const stageBd = summary.stage_breakdown;
+  if (stageBd.in_transit.temp_violations > 0) {
+    scores[RESPONSIBILITY.CARRIER] += stageBd.in_transit.temp_violations * 2;
+  }
+  if (stageBd.stop.temp_violations > 0) {
+    scores[RESPONSIBILITY.CARRIER] += stageBd.stop.temp_violations;
+  }
+  if (stageBd.in_transit.peak_violations > 0) {
+    scores[RESPONSIBILITY.CARRIER] += stageBd.in_transit.peak_violations * 3;
+  }
+
+  if (summary.cooler_incidents.error_count > 0) {
+    scores[RESPONSIBILITY.EQUIPMENT] += summary.cooler_incidents.error_count * 3;
+  }
+  if (summary.cooler_incidents.warning_count > 0) {
+    scores[RESPONSIBILITY.EQUIPMENT] += summary.cooler_incidents.warning_count;
+  }
+  if (summary.temp_violations.peak_violation_count > 0) {
+    scores[RESPONSIBILITY.EQUIPMENT] += summary.temp_violations.peak_violation_count;
+  }
+
+  if (stageBd.loading_unloading.door_incidents > 0) {
+    scores[RESPONSIBILITY.LOADING] += stageBd.loading_unloading.door_incidents * 2;
+  }
+  if (stageBd.loading_unloading.temp_violations > 0) {
+    scores[RESPONSIBILITY.LOADING] += stageBd.loading_unloading.temp_violations;
+  }
+  if (summary.door_incidents.count > 0 && stageBd.loading_unloading.door_incidents > 0) {
+    const loadingRatio = stageBd.loading_unloading.door_incidents / Math.max(summary.door_incidents.count, 1);
+    if (loadingRatio > 0.5) {
+      scores[RESPONSIBILITY.LOADING] += 2;
+    }
+  }
+
+  const activeParties = Object.keys(scores).filter(function(k) { return scores[k] > 0; });
+  if (activeParties.length >= 3) {
+    return {
+      tendency: RESPONSIBILITY.JOINT_REVIEW,
+      label: respConfig.joint_review.label,
+      scores: scores,
+      reasoning: buildResponsibilityReasoning(scores, RESPONSIBILITY.JOINT_REVIEW)
+    };
+  }
+  if (activeParties.length >= 2) {
+    const maxScore = Math.max.apply(null, activeParties.map(function(k) { return scores[k]; }));
+    const secondMax = activeParties.map(function(k) { return scores[k]; }).sort(function(a, b) { return b - a; })[1];
+    if (secondMax >= maxScore * 0.5) {
+      return {
+        tendency: RESPONSIBILITY.JOINT_REVIEW,
+        label: respConfig.joint_review.label,
+        scores: scores,
+        reasoning: buildResponsibilityReasoning(scores, RESPONSIBILITY.JOINT_REVIEW)
+      };
+    }
+  }
+
+  let maxKey = RESPONSIBILITY.CARRIER;
+  for (const k of Object.keys(scores)) {
+    if (scores[k] > scores[maxKey]) maxKey = k;
+  }
+  if (scores[maxKey] === 0) {
+    maxKey = RESPONSIBILITY.CARRIER;
+  }
+
+  return {
+    tendency: maxKey,
+    label: respConfig[maxKey].label,
+    scores: scores,
+    reasoning: buildResponsibilityReasoning(scores, maxKey)
+  };
+}
+
+function buildResponsibilityReasoning(scores, tendency) {
+  const parts = [];
+  if (scores[RESPONSIBILITY.CARRIER] > 0) {
+    parts.push('在途/停靠阶段温度异常（得分' + scores[RESPONSIBILITY.CARRIER] + '）');
+  }
+  if (scores[RESPONSIBILITY.EQUIPMENT] > 0) {
+    parts.push('制冷设备故障或异常（得分' + scores[RESPONSIBILITY.EQUIPMENT] + '）');
+  }
+  if (scores[RESPONSIBILITY.LOADING] > 0) {
+    parts.push('装卸阶段开门及温度异常（得分' + scores[RESPONSIBILITY.LOADING] + '）');
+  }
+  if (tendency === RESPONSIBILITY.JOINT_REVIEW) {
+    return '多方因素交织，需共同复核：' + parts.join('；');
+  }
+  if (parts.length > 0) {
+    return '主要责任倾向：' + parts[0] + (parts.length > 1 ? '；次要因素：' + parts.slice(1).join('；') : '');
+  }
+  return '无明确异常，责任倾向不适用。';
+}
+
+function buildQualityInspection(summary, waybill) {
+  const riskLevel = summary.signoff_risk ? summary.signoff_risk.level : SIGNOFF_RISK_LEVEL.SUGGEST_SIGNOFF;
+  const qiConfig = config.qualityInspection;
+  const priority = qiConfig.samplingPriority[riskLevel];
+  if (!priority) return null;
+
+  let itemKey = 'default';
+  const zoneCode = (waybill.zone_code || '').toUpperCase();
+  if (zoneCode === 'FROZEN' || zoneCode === 'SEMI_FROZEN') itemKey = 'frozen';
+  else if (zoneCode === 'CHILLED') itemKey = 'chilled';
+  else if (zoneCode === 'ICE_CHILLED') itemKey = 'ice_chilled';
+
+  const items = qiConfig.itemsByMeatType[itemKey] || qiConfig.itemsByMeatType.default;
+  const evidenceList = qiConfig.evidenceRetention.slice();
+
+  if (summary.temp_violations.count > 0) {
+    evidenceList.push('超温片段温度曲线截图');
+  }
+  if (summary.door_incidents.count > 0) {
+    evidenceList.push('开门事件记录截图');
+  }
+  if (summary.cooler_incidents.error_count > 0) {
+    evidenceList.push('制冷机故障日志');
+  }
+
+  return {
+    sampling_priority: priority,
+    sampling_priority_label: priority === 'high' ? '优先抽检' : '常规抽检',
+    suggested_items: items,
+    evidence_retention_list: evidenceList
+  };
+}
+
+function buildStageOverview(stageBreakdown) {
+  const stagesWithIssues = [];
+  for (const key of ['in_transit', 'stop', 'loading_unloading']) {
+    const s = stageBreakdown[key];
+    if (s && (s.temp_violations > 0 || s.door_incidents > 0)) {
+      stagesWithIssues.push({ key: key, label: s.label, temp_violations: s.temp_violations, door_incidents: s.door_incidents });
+    }
+  }
+  if (stagesWithIssues.length === 0) {
+    return '全程各运输阶段未见异常。';
+  }
+  if (stagesWithIssues.length === 1) {
+    const s = stagesWithIssues[0];
+    return '异常主要集中在' + s.label + '阶段。';
+  }
+  const labels = stagesWithIssues.map(function(s) { return s.label; });
+  const maxStage = stagesWithIssues.reduce(function(a, b) {
+    return (b.temp_violations + b.door_incidents) > (a.temp_violations + a.door_incidents) ? b : a;
+  });
+  return '异常涉及' + labels.join('、') + '阶段，其中' + maxStage.label + '阶段问题较为突出。';
+}
+
 function summarizeWaybillAudit(waybillNo) {
   const waybill = waybillRepo.getByNo(waybillNo);
   if (!waybill) return null;
@@ -460,6 +621,18 @@ function summarizeWaybillAudit(waybillNo) {
   summary.affects_signoff = risk.level === SIGNOFF_RISK_LEVEL.REJECTION_RECOMMENDED;
   summary.signoff_note = risk.signoff_note;
 
+  const resp = evaluateResponsibilityTendency(summary, audits);
+  summary.responsibility_tendency = {
+    tendency: resp.tendency,
+    label: resp.label,
+    reasoning: resp.reasoning
+  };
+
+  const qi = buildQualityInspection(summary, waybill);
+  if (qi) {
+    summary.quality_inspection = qi;
+  }
+
   return summary;
 }
 
@@ -569,6 +742,13 @@ function generateTextConclusion(summary, waybill, zoneConfig, audits, audience) 
       lines.push('签收说明：' + summary.signoff_note);
     }
   }
+  if (summary.responsibility_tendency) {
+    if (isInternal) {
+      lines.push('责任倾向：' + summary.responsibility_tendency.label + ' - ' + summary.responsibility_tendency.reasoning);
+    } else {
+      lines.push('责任说明：异常主要与' + summary.responsibility_tendency.label + '相关，具体原因正在核实中。');
+    }
+  }
   lines.push('');
 
   if (isInternal) {
@@ -599,6 +779,26 @@ function generateTextConclusion(summary, waybill, zoneConfig, audits, audience) 
       if (s.segment_count > 0) {
         lines.push(s.label + '：片段' + s.segment_count + '个，超温' + s.temp_violations + '次(含瞬时严重' + s.peak_violations + '次)，开门异常' + s.door_incidents + '次');
       }
+    }
+    lines.push('');
+  } else {
+    if (summary.stage_breakdown) {
+      const overview = buildStageOverview(summary.stage_breakdown);
+      lines.push('--- 运输阶段概览 ---');
+      lines.push(overview);
+      lines.push('');
+    }
+  }
+
+  if (summary.quality_inspection) {
+    if (isInternal) {
+      lines.push('--- 质检建议 ---');
+      lines.push('抽检优先级：' + summary.quality_inspection.sampling_priority_label);
+      lines.push('建议抽检项目：' + summary.quality_inspection.suggested_items.join('、'));
+      lines.push('保留证据清单：' + summary.quality_inspection.evidence_retention_list.join('、'));
+    } else {
+      lines.push('--- 质检提示 ---');
+      lines.push('建议对到货进行' + summary.quality_inspection.sampling_priority_label + '，主要关注' + summary.quality_inspection.suggested_items.slice(0, 2).join('和') + '。');
     }
     lines.push('');
   }
@@ -734,6 +934,8 @@ function generateEvidence(waybillNo, options) {
       status_counts: summary.status_counts,
       affects_signoff: summary.affects_signoff,
       signoff_risk: summary.signoff_risk,
+      responsibility_tendency: summary.responsibility_tendency,
+      quality_inspection: summary.quality_inspection || null,
       period_breakdown: summary.period_breakdown,
       stage_breakdown: summary.stage_breakdown
     },
@@ -777,9 +979,99 @@ function generateEvidence(waybillNo, options) {
     evidence.temperature_analysis.violation_segments = [];
     evidence.door_records.incidents = [];
     evidence.timeline = [];
+    evidence.summary.stage_overview = buildStageOverview(summary.stage_breakdown);
+    if (summary.responsibility_tendency) {
+      evidence.summary.responsibility_tendency = {
+        tendency: summary.responsibility_tendency.tendency,
+        label: summary.responsibility_tendency.label
+      };
+    }
+    if (summary.quality_inspection) {
+      evidence.summary.quality_inspection = {
+        sampling_priority: summary.quality_inspection.sampling_priority,
+        sampling_priority_label: summary.quality_inspection.sampling_priority_label,
+        suggested_items: summary.quality_inspection.suggested_items.slice(0, 2),
+        evidence_retention_list: summary.quality_inspection.evidence_retention_list.slice(0, 3)
+      };
+    }
   }
 
   return evidence;
+}
+
+function generateDisposalOrder(waybillNo, options) {
+  const opts = options || {};
+  const audience = opts.audience || 'internal';
+  const waybill = waybillRepo.getByNo(waybillNo);
+  if (!waybill) return null;
+
+  const audits = auditRepo.getByWaybill(waybillNo);
+  const summary = summarizeWaybillAudit(waybillNo);
+  const zoneConfig = zoneConfigRepo.getByCode(waybill.zone_code);
+
+  const keySegments = audits
+    .filter(function(a) { return a.status !== 'normal'; })
+    .map(function(a) {
+      return {
+        segment_id: a.segment_id,
+        start_time: a.start_time,
+        end_time: a.end_time,
+        status: a.status,
+        temp_status: a.temp_status,
+        door_status: a.door_status,
+        cooler_status: a.cooler_status,
+        transport_stage: a.transport_stage,
+        avg_temp: a.avg_temp,
+        max_temp: a.max_temp,
+        location: a.location_name,
+        description: describeEvent(a)
+      };
+    });
+
+  const disposalId = 'DISPOSAL_' + waybillNo + '_' + Date.now();
+
+  const disposal = {
+    disposal_id: disposalId,
+    waybill_no: waybillNo,
+    generated_at: new Date().toISOString(),
+    audience: audience,
+    waybill_info: {
+      waybill_no: waybillNo,
+      meat_type: waybill.meat_type,
+      shipper: waybill.shipper,
+      consignee: waybill.consignee,
+      origin: waybill.origin,
+      destination: waybill.destination,
+      zone_code: waybill.zone_code,
+      zone_name: zoneConfig ? zoneConfig.zone_name : null,
+      zone_range: zoneConfig ? { min: zoneConfig.min_temp, max: zoneConfig.max_temp } : null
+    },
+    signoff_suggestion: {
+      level: summary.signoff_risk ? summary.signoff_risk.level : null,
+      label: summary.signoff_risk ? summary.signoff_risk.label : null,
+      note: summary.signoff_note || null,
+      factors: summary.signoff_risk ? summary.signoff_risk.factors : []
+    },
+    responsibility_tendency: summary.responsibility_tendency || null,
+    quality_inspection: summary.quality_inspection || null,
+    key_segments: keySegments,
+    overall_status: summary.overall_status,
+    status_counts: summary.status_counts,
+    text_conclusion: generateTextConclusion(summary, waybill, zoneConfig, audits, audience)
+  };
+
+  if (audience === 'customer') {
+    disposal.key_segments = keySegments.slice(0, 3).map(function(s) {
+      return {
+        start_time: s.start_time,
+        end_time: s.end_time,
+        status: s.status,
+        description: s.description
+      };
+    });
+  }
+
+  return disposal;
 }
 
 module.exports = {
@@ -789,11 +1081,17 @@ module.exports = {
   COOLER_STATUS_ENUM,
   TRANSPORT_STAGE,
   SIGNOFF_RISK_LEVEL,
+  RESPONSIBILITY,
   auditSegment,
   processSegmentAudit,
   summarizeWaybillAudit,
   generateEvidence,
+  generateDisposalOrder,
+  generateTextConclusion,
   getTimePeriod,
   classifyTransportStage,
-  evaluateSignoffRisk
+  evaluateSignoffRisk,
+  evaluateResponsibilityTendency,
+  buildQualityInspection,
+  buildStageOverview
 };

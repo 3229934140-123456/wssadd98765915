@@ -620,6 +620,105 @@ async function runTests() {
     const combinedFilter = r.body.data;
     assert('联合筛选结果均为violation', combinedFilter.every(function(a) { return a.status === 'violation'; }));
 
+    console.log('\n[25] 数据库迁移兼容 - 老库无transport_stage列不报错');
+    const migWaybillNo = 'TEST-MIG-001';
+    r = await httpRequest('POST', '/api/waybills', {
+      waybill_no: migWaybillNo, meat_type: '冷鲜猪肉', zone_code: 'CHILLED'
+    });
+    assert('迁移测试运单创建成功', r.status === 201 && r.body.code === 0);
+    r = await httpRequest('POST', '/api/segments', {
+      waybill_no: migWaybillNo,
+      start_time: '2026-06-22T08:00:00', end_time: '2026-06-22T10:00:00',
+      avg_temp: 2, min_temp: 0, max_temp: 3,
+      location_name: '普通路段', door_open: 0, cooler_status: 'normal'
+    });
+    assert('不带transport_stage的片段上传成功', r.status === 201 && r.body.code === 0);
+    r = await httpRequest('GET', '/api/summary/waybill/' + migWaybillNo);
+    assert('老片段查摘要不报500', r.status === 200 && r.body.code === 0);
+    assert('摘要含stage_breakdown', r.body.data.stage_breakdown != null);
+
+    console.log('\n[26] 责任倾向判定 - 承运方');
+    r = await httpRequest('GET', '/api/summary/waybill/' + badWaybillNo);
+    assert('违规运单摘要含 responsibility_tendency', r.body.data.responsibility_tendency != null);
+    assert('责任倾向含 tendency 字段', r.body.data.responsibility_tendency.tendency != null);
+    assert('责任倾向含 label 字段', typeof r.body.data.responsibility_tendency.label === 'string');
+    assert('责任倾向含 reasoning 字段', typeof r.body.data.responsibility_tendency.reasoning === 'string');
+    assert('推理说明含关键词', r.body.data.responsibility_tendency.reasoning.length > 0);
+
+    console.log('\n[27] 责任倾向判定 - 设备方（制冷机故障为主）');
+    const equipWaybillNo = 'TEST-EQUIP-001';
+    r = await httpRequest('POST', '/api/waybills', {
+      waybill_no: equipWaybillNo, meat_type: '冻猪肉', zone_code: 'FROZEN'
+    });
+    assert('设备方测试运单创建成功', r.status === 201 && r.body.code === 0);
+    r = await httpRequest('POST', '/api/segments/batch', {
+      segments: [
+        { waybill_no: equipWaybillNo, start_time: '2026-06-22T08:00:00', end_time: '2026-06-22T10:00:00',
+          avg_temp: -20, min_temp: -22, max_temp: -18, location_name: '在途', door_open: 0, cooler_status: 'error' },
+        { waybill_no: equipWaybillNo, start_time: '2026-06-22T10:00:00', end_time: '2026-06-22T12:00:00',
+          avg_temp: -20, min_temp: -22, max_temp: -18, location_name: '在途', door_open: 0, cooler_status: 'error' }
+      ]
+    });
+    assert('设备方测试片段上传成功', r.status === 200 && r.body.data.success === 2);
+    r = await httpRequest('GET', '/api/summary/waybill/' + equipWaybillNo);
+    assert('设备方摘要含责任倾向', r.body.data.responsibility_tendency != null);
+    assert('设备方责任倾向为equipment', r.body.data.responsibility_tendency.tendency === 'equipment',
+      '实际=' + r.body.data.responsibility_tendency.tendency);
+
+    console.log('\n[28] 质检联动 - 复核/拒收时给出抽检建议');
+    r = await httpRequest('GET', '/api/summary/waybill/' + badWaybillNo);
+    assert('拒收运单含 quality_inspection', r.body.data.quality_inspection != null);
+    const qi = r.body.data.quality_inspection;
+    assert('抽检优先级为high', qi.sampling_priority === 'high', '实际=' + qi.sampling_priority);
+    assert('含抽检优先级标签', typeof qi.sampling_priority_label === 'string');
+    assert('含建议抽检项目数组', Array.isArray(qi.suggested_items) && qi.suggested_items.length > 0);
+    assert('含保留证据清单数组', Array.isArray(qi.evidence_retention_list) && qi.evidence_retention_list.length > 0);
+
+    r = await httpRequest('GET', '/api/summary/waybill/' + safeWaybillNo);
+    assert('正常运单无质检建议', r.body.data.quality_inspection == null || r.body.data.quality_inspection.sampling_priority == null);
+
+    console.log('\n[29] 客户版证据保留运输阶段概览');
+    r = await httpRequest('POST', '/api/evidence/' + badWaybillNo, { audience: 'customer' });
+    assert('客户版证据含 stage_overview', r.body.data.summary.stage_overview != null);
+    assert('stage_overview 非空字符串', r.body.data.summary.stage_overview.length > 0);
+    assert('客户版文本含运输阶段概览章节', r.body.data.text_conclusion.includes('运输阶段概览'));
+    assert('客户版责任倾向只有tendency和label', r.body.data.summary.responsibility_tendency != null && r.body.data.summary.responsibility_tendency.reasoning == null);
+    assert('客户版质检建议项目精简', r.body.data.summary.quality_inspection != null && r.body.data.summary.quality_inspection.suggested_items.length <= 2);
+    assert('客户版证据清单精简', r.body.data.summary.quality_inspection.evidence_retention_list.length <= 3);
+
+    console.log('\n[30] 处置单导出 - 内部版');
+    r = await httpRequest('POST', '/api/disposal/' + badWaybillNo, { audience: 'internal' });
+    assert('处置单生成成功', r.status === 200 && r.body.code === 0);
+    const disposal = r.body.data;
+    assert('处置单含 disposal_id', disposal.disposal_id != null && disposal.disposal_id.startsWith('DISPOSAL_'));
+    assert('处置单含运单号', disposal.waybill_no === badWaybillNo);
+    assert('处置单含签收建议', disposal.signoff_suggestion != null && disposal.signoff_suggestion.level != null);
+    assert('处置单含责任倾向', disposal.responsibility_tendency != null);
+    assert('处置单含质检建议', disposal.quality_inspection != null);
+    assert('处置单含关键片段列表', Array.isArray(disposal.key_segments) && disposal.key_segments.length > 0);
+    assert('关键片段含segment_id', disposal.key_segments[0].segment_id != null);
+    assert('关键片段含transport_stage', disposal.key_segments[0].transport_stage != null);
+    assert('处置单含文本结论', typeof disposal.text_conclusion === 'string');
+    assert('内部版文本含责任倾向章节', disposal.text_conclusion.includes('责任倾向'));
+    assert('内部版文本含质检建议章节', disposal.text_conclusion.includes('质检建议'));
+
+    console.log('\n[31] 处置单导出 - 客户版');
+    r = await httpRequest('POST', '/api/disposal/' + badWaybillNo, { audience: 'customer' });
+    assert('客户版处置单生成成功', r.status === 200 && r.body.code === 0);
+    const custDisposal = r.body.data;
+    assert('客户版处置单含disposal_id', custDisposal.disposal_id != null);
+    assert('客户版关键片段不超过3条', custDisposal.key_segments.length <= 3);
+    assert('客户版关键片段不含segment_id', custDisposal.key_segments.every(function(s) { return s.segment_id == null; }));
+    assert('客户版文本含责任说明', custDisposal.text_conclusion.includes('责任说明'));
+    assert('客户版文本含质检提示', custDisposal.text_conclusion.includes('质检提示'));
+    assert('客户版文本含运输阶段概览', custDisposal.text_conclusion.includes('运输阶段概览'));
+
+    r = await httpRequest('POST', '/api/disposal/' + badWaybillNo, { audience: 'invalid' });
+    assert('处置单非法audience返回400', r.status === 400);
+
+    r = await httpRequest('POST', '/api/disposal/NONEXIST', { audience: 'internal' });
+    assert('处置单不存在的运单返回404', r.status === 404);
+
   } catch (e) {
     console.error('\u6d4b\u8bd5\u8fd0\u884c\u51fa\u9519:', e);
     failed++;

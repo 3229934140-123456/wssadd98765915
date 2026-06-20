@@ -38,5 +38,32 @@ module.exports = {
       hasCoolerError: true,
       doorViolationCount: 3
     }
+  },
+  responsibility: {
+    carrier: { label: '承运方', key: 'carrier' },
+    equipment: { label: '设备方', key: 'equipment' },
+    loading: { label: '装卸方', key: 'loading' },
+    joint_review: { label: '需共同复核', key: 'joint_review' }
+  },
+  qualityInspection: {
+    samplingPriority: {
+      rejection_recommended: 'high',
+      review_required: 'medium',
+      suggest_signoff: null
+    },
+    itemsByMeatType: {
+      default: ['中心温度抽检', '感官品质检查', '包装完整性检查'],
+      frozen: ['中心温度抽检', '解冻失水率检测', '冰晶状态检查', '包装完整性检查'],
+      chilled: ['中心温度抽检', '菌落总数检测', '感官品质检查', '色泽气味检查'],
+      ice_chilled: ['中心温度抽检', '鲜度指标检测', '感官品质检查', '包装密封检查']
+    },
+    evidenceRetention: [
+      '运输过程温度记录',
+      '开门事件及持续时间记录',
+      '制冷机运行状态日志',
+      '异常片段原始数据',
+      '签收时货物现场照片',
+      '温度检测仪校准记录'
+    ]
   }
 };

@@ -36,6 +36,7 @@ async function initDb() {
   }
 
   createTables();
+  migrateDb();
   seedZoneConfigs();
   saveDb();
   return db;
@@ -108,6 +109,31 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_segments_time ON temperature_segments(waybill_no, start_time);
   `;
   db.run(sql);
+}
+
+function getTableColumns(tableName) {
+  const stmt = db.prepare('PRAGMA table_info(' + tableName + ')');
+  const cols = [];
+  while (stmt.step()) {
+    const row = stmt.getAsObject();
+    cols.push(row.name);
+  }
+  stmt.free();
+  return cols;
+}
+
+function migrateDb() {
+  const migrations = [
+    { table: 'temperature_segments', column: 'transport_stage', type: 'TEXT', default: null },
+    { table: 'audit_results', column: 'transport_stage', type: 'TEXT', default: null }
+  ];
+  for (const m of migrations) {
+    const cols = getTableColumns(m.table);
+    if (cols.indexOf(m.column) < 0) {
+      const defVal = m.default != null ? ' DEFAULT ' + m.default : '';
+      db.run('ALTER TABLE ' + m.table + ' ADD COLUMN ' + m.column + ' ' + m.type + defVal);
+    }
+  }
 }
 
 function seedZoneConfigs() {

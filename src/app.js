@@ -1,7 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const { initDb, zoneConfigRepo, waybillRepo, segmentRepo, auditRepo } = require('./db');
-const { processSegmentAudit, summarizeWaybillAudit, generateEvidence } = require('./auditEngine');
+const { processSegmentAudit, summarizeWaybillAudit, generateEvidence, generateDisposalOrder } = require('./auditEngine');
 
 let dbReady = false;
 let dbInitPromise = null;
@@ -45,6 +45,7 @@ async function createApp() {
         audit_results: 'GET /api/audits/waybill/:waybillNo',
         audit_summary: 'GET /api/summary/waybill/:waybillNo',
         evidence: 'POST /api/evidence/:waybillNo',
+        disposal: 'POST /api/disposal/:waybillNo',
         health: 'GET /health'
       }
     });
@@ -250,6 +251,23 @@ async function createApp() {
         return res.status(404).json({ code: 404, error: '运单不存在' });
       }
       res.json({ code: 0, data: evidence });
+    } catch (e) {
+      res.status(500).json({ code: 500, error: e.message });
+    }
+  });
+
+  app.post('/api/disposal/:waybillNo', function(req, res) {
+    try {
+      const opts = {};
+      opts.audience = (req.body && req.body.audience) || 'internal';
+      if (['internal', 'customer'].indexOf(opts.audience) < 0) {
+        return res.status(400).json({ code: 400, error: 'audience 必须是 internal 或 customer' });
+      }
+      const disposal = generateDisposalOrder(req.params.waybillNo, opts);
+      if (!disposal) {
+        return res.status(404).json({ code: 404, error: '运单不存在' });
+      }
+      res.json({ code: 0, data: disposal });
     } catch (e) {
       res.status(500).json({ code: 500, error: e.message });
     }
