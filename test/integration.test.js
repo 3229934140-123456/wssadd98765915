@@ -687,7 +687,7 @@ async function runTests() {
     assert('客户版证据清单精简', r.body.data.summary.quality_inspection.evidence_retention_list.length <= 3);
 
     console.log('\n[30] 处置单导出 - 内部版');
-    r = await httpRequest('POST', '/api/disposal/' + badWaybillNo, { audience: 'internal' });
+    r = await httpRequest('POST', '/api/disposal/waybill/' + badWaybillNo, { audience: 'internal' });
     assert('处置单生成成功', r.status === 200 && r.body.code === 0);
     const disposal = r.body.data;
     assert('处置单含 disposal_id', disposal.disposal_id != null && disposal.disposal_id.startsWith('DISPOSAL_'));
@@ -701,9 +701,12 @@ async function runTests() {
     assert('处置单含文本结论', typeof disposal.text_conclusion === 'string');
     assert('内部版文本含责任倾向章节', disposal.text_conclusion.includes('责任倾向'));
     assert('内部版文本含质检建议章节', disposal.text_conclusion.includes('质检建议'));
+    assert('处置单含status', disposal.status != null);
+    assert('处置单含created_at', disposal.created_at != null);
+    assert('处置单含processing_notes数组', Array.isArray(disposal.processing_notes));
 
     console.log('\n[31] 处置单导出 - 客户版');
-    r = await httpRequest('POST', '/api/disposal/' + badWaybillNo, { audience: 'customer' });
+    r = await httpRequest('POST', '/api/disposal/waybill/' + badWaybillNo, { audience: 'customer' });
     assert('客户版处置单生成成功', r.status === 200 && r.body.code === 0);
     const custDisposal = r.body.data;
     assert('客户版处置单含disposal_id', custDisposal.disposal_id != null);
@@ -712,12 +715,85 @@ async function runTests() {
     assert('客户版文本含责任说明', custDisposal.text_conclusion.includes('责任说明'));
     assert('客户版文本含质检提示', custDisposal.text_conclusion.includes('质检提示'));
     assert('客户版文本含运输阶段概览', custDisposal.text_conclusion.includes('运输阶段概览'));
+    assert('客户版无processing_notes', custDisposal.processing_notes == null);
 
-    r = await httpRequest('POST', '/api/disposal/' + badWaybillNo, { audience: 'invalid' });
+    r = await httpRequest('POST', '/api/disposal/waybill/' + badWaybillNo, { audience: 'invalid' });
     assert('处置单非法audience返回400', r.status === 400);
 
-    r = await httpRequest('POST', '/api/disposal/NONEXIST', { audience: 'internal' });
+    r = await httpRequest('POST', '/api/disposal/waybill/NONEXIST', { audience: 'internal' });
     assert('处置单不存在的运单返回404', r.status === 404);
+
+    console.log('\n[32] 处置单幂等 - 同一运单返回同一单号');
+    const first = await httpRequest('POST', '/api/disposal/waybill/' + badWaybillNo, { audience: 'internal' });
+    const second = await httpRequest('POST', '/api/disposal/waybill/' + badWaybillNo, { audience: 'internal' });
+    assert('两次生成处置单ID相同', first.body.data.disposal_id === second.body.data.disposal_id);
+    assert('可按disposal_id查询', await (async function() {
+      const r3 = await httpRequest('GET', '/api/disposal/' + first.body.data.disposal_id);
+      return r3.status === 200 && r3.body.code === 0 && r3.body.data.disposal_id === first.body.data.disposal_id;
+    })());
+
+    console.log('\n[33] 责任协同 - 三方备注与最终结论');
+    const dispId = first.body.data.disposal_id;
+    r = await httpRequest('POST', '/api/disposal/' + dispId + '/note',
+      { party: 'carrier', note: '司机承认中途休息时未注意温度', operator: '张调度' });
+    assert('承运方备注成功', r.status === 200 && r.body.code === 0);
+    assert('备注列表含承运方记录', r.body.data.processing_notes.some(function(n) { return n.party === 'carrier'; }));
+    assert('latest_note存在', r.body.data.latest_note != null && r.body.data.latest_note.party === 'carrier');
+
+    r = await httpRequest('POST', '/api/disposal/' + dispId + '/note',
+      { party: 'equipment', note: '制冷机已回厂检测，压缩机卡缸', operator: '李工' });
+    assert('设备方备注成功', r.status === 200 && r.body.code === 0);
+
+    r = await httpRequest('POST', '/api/disposal/' + dispId + '/final', {
+      final_responsibility: 'equipment',
+      final_note: '设备故障是主因，承运方监管不到位负次责',
+      operator: '王客服'
+    });
+    assert('最终结论成功', r.status === 200 && r.body.code === 0);
+    assert('最终责任为equipment', r.body.data.final_conclusion.responsibility === 'equipment');
+    assert('状态变为closed', r.body.data.status === 'closed');
+    assert('最终结论备注正确', r.body.data.final_conclusion.note.includes('设备故障'));
+
+    r = await httpRequest('POST', '/api/disposal/' + dispId + '/note', { party: 'invalid_party' });
+    assert('非法party返回400', r.status === 400);
+
+    r = await httpRequest('POST', '/api/disposal/NONEXIST/note', { party: 'carrier' });
+    assert('不存在的处置单加备注返回404', r.status === 404);
+
+    console.log('\n[34] 稽核结果接口带运单摘要');
+    r = await httpRequest('GET', '/api/audits/waybill/' + badWaybillNo);
+    assert('稽核结果返回成功', r.status === 200 && r.body.code === 0);
+    assert('带waybill_summary字段', r.body.waybill_summary != null);
+    assert('摘要含signoff_risk', r.body.waybill_summary.signoff_risk != null);
+    assert('摘要含responsibility_tendency', r.body.waybill_summary.responsibility_tendency != null);
+    assert('摘要含quality_inspection', r.body.waybill_summary.quality_inspection != null);
+    assert('摘要含status_counts', r.body.waybill_summary.status_counts != null);
+    assert('摘要含overall_status', r.body.waybill_summary.overall_status != null);
+
+    console.log('\n[35] 批量风险看板 - 多运单分组与优先级标记');
+    const normalWaybill2 = 'WB-NORMAL-RISK2';
+    await httpRequest('POST', '/api/waybills', {
+      waybill_no: normalWaybill2, meat_type: '冷鲜猪肉', zone_code: 'CHILLED'
+    });
+    await httpRequest('POST', '/api/segments', {
+      waybill_no: normalWaybill2, start_time: '2024-06-21 10:00:00',
+      end_time: '2024-06-21 11:00:00', avg_temp: 2, min_temp: 1, max_temp: 3, sample_count: 60
+    });
+
+    const boardReq = { waybill_nos: [badWaybillNo, waybillNo, normalWaybill2, 'WB-NOT-EXIST'] };
+    r = await httpRequest('POST', '/api/risk-board', boardReq);
+    assert('风险看板返回成功', r.status === 200 && r.body.code === 0);
+    assert('total正确', r.body.data.total === 4);
+    assert('分三组返回', r.body.data.grouped.rejection_recommended != null &&
+      r.body.data.grouped.review_required != null && r.body.data.grouped.suggest_signoff != null);
+    assert('建议拒收组含异常运单', r.body.data.grouped.rejection_recommended.waybills.length >= 1);
+    assert('建议签收组含正常运单', r.body.data.grouped.suggest_signoff.waybills.length >= 1);
+    assert('priority_flags含need_quality_inspection', Array.isArray(r.body.data.priority_flags.need_quality_inspection));
+    assert('priority_flags含need_equipment_followup', Array.isArray(r.body.data.priority_flags.need_equipment_followup));
+    assert('拒收组运单含violation_count', r.body.data.grouped.rejection_recommended.waybills[0].violation_count != null);
+
+    r = await httpRequest('POST', '/api/risk-board', {});
+    assert('空waybill_nos返回400', r.status === 400);
 
   } catch (e) {
     console.error('\u6d4b\u8bd5\u8fd0\u884c\u51fa\u9519:', e);

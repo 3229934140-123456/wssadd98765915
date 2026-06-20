@@ -1,6 +1,6 @@
 const moment = require('moment');
 const config = require('../config');
-const { zoneConfigRepo, waybillRepo, segmentRepo, auditRepo } = require('./db');
+const { zoneConfigRepo, waybillRepo, segmentRepo, auditRepo, disposalRepo } = require('./db');
 
 const AUDIT_STATUS = {
   NORMAL: 'normal',
@@ -1009,6 +1009,21 @@ function generateDisposalOrder(waybillNo, options) {
   const summary = summarizeWaybillAudit(waybillNo);
   const zoneConfig = zoneConfigRepo.getByCode(waybill.zone_code);
 
+  const signoffLevel = summary.signoff_risk ? summary.signoff_risk.level : null;
+  const respTendency = summary.responsibility_tendency ? summary.responsibility_tendency.tendency : null;
+  const qualityPriority = summary.quality_inspection ? summary.quality_inspection.sampling_priority : null;
+
+  const persisted = disposalRepo.upsertByWaybill({
+    disposal_id: 'DISPOSAL_' + waybillNo + '_' + Date.now(),
+    waybill_no: waybillNo,
+    signoff_level: signoffLevel,
+    responsibility_tendency: respTendency,
+    quality_priority: qualityPriority
+  });
+
+  const notes = disposalRepo.getNotes(persisted.disposal_id);
+  const latestNote = notes.length > 0 ? notes[notes.length - 1] : null;
+
   const keySegments = audits
     .filter(function(a) { return a.status !== 'normal'; })
     .map(function(a) {
@@ -1028,13 +1043,13 @@ function generateDisposalOrder(waybillNo, options) {
       };
     });
 
-  const disposalId = 'DISPOSAL_' + waybillNo + '_' + Date.now();
-
   const disposal = {
-    disposal_id: disposalId,
+    disposal_id: persisted.disposal_id,
     waybill_no: waybillNo,
-    generated_at: new Date().toISOString(),
     audience: audience,
+    status: persisted.status,
+    created_at: persisted.created_at,
+    updated_at: persisted.updated_at,
     waybill_info: {
       waybill_no: waybillNo,
       meat_type: waybill.meat_type,
@@ -1057,6 +1072,12 @@ function generateDisposalOrder(waybillNo, options) {
     key_segments: keySegments,
     overall_status: summary.overall_status,
     status_counts: summary.status_counts,
+    final_conclusion: persisted.final_responsibility ? {
+      responsibility: persisted.final_responsibility,
+      note: persisted.final_note
+    } : null,
+    processing_notes: notes,
+    latest_note: latestNote,
     text_conclusion: generateTextConclusion(summary, waybill, zoneConfig, audits, audience)
   };
 
@@ -1069,9 +1090,134 @@ function generateDisposalOrder(waybillNo, options) {
         description: s.description
       };
     });
+    delete disposal.processing_notes;
+    delete disposal.latest_note;
+    if (disposal.responsibility_tendency) {
+      disposal.responsibility_tendency = {
+        tendency: disposal.responsibility_tendency.tendency,
+        label: disposal.responsibility_tendency.label
+      };
+    }
+    if (disposal.quality_inspection) {
+      disposal.quality_inspection = {
+        sampling_priority: disposal.quality_inspection.sampling_priority,
+        suggested_items: (disposal.quality_inspection.suggested_items || []).slice(0, 2),
+        evidence_retention_list: (disposal.quality_inspection.evidence_retention_list || []).slice(0, 3)
+      };
+    }
   }
 
   return disposal;
+}
+
+function getDisposalOrder(disposalId, options) {
+  const opts = options || {};
+  const audience = opts.audience || 'internal';
+  const persisted = disposalRepo.getByDisposalId(disposalId);
+  if (!persisted) return null;
+  return generateDisposalOrder(persisted.waybill_no, { audience: audience });
+}
+
+function getDisposalByWaybill(waybillNo, options) {
+  const opts = options || {};
+  const audience = opts.audience || 'internal';
+  const persisted = disposalRepo.getByWaybill(waybillNo);
+  if (!persisted) return null;
+  return generateDisposalOrder(waybillNo, { audience: audience });
+}
+
+function addDisposalNote(disposalId, party, note, operator) {
+  const persisted = disposalRepo.getByDisposalId(disposalId);
+  if (!persisted) return null;
+  const validParties = ['carrier', 'equipment', 'loading', 'customer_service', 'other'];
+  if (validParties.indexOf(party) < 0) {
+    throw new Error('party 必须是 carrier/equipment/loading/customer_service/other 之一');
+  }
+  disposalRepo.addNote(disposalId, party, note, operator);
+  return generateDisposalOrder(persisted.waybill_no, { audience: 'internal' });
+}
+
+function setDisposalFinalConclusion(disposalId, finalResponsibility, finalNote, operator) {
+  const persisted = disposalRepo.getByDisposalId(disposalId);
+  if (!persisted) return null;
+  const validResp = ['carrier', 'equipment', 'loading', 'joint_review', 'undetermined'];
+  if (validResp.indexOf(finalResponsibility) < 0) {
+    throw new Error('final_responsibility 必须是 carrier/equipment/loading/joint_review/undetermined 之一');
+  }
+  disposalRepo.setFinalConclusion(disposalId, finalResponsibility, finalNote);
+  if (operator || finalNote) {
+    disposalRepo.addNote(disposalId, 'customer_service',
+      '最终结论: ' + finalResponsibility + (finalNote ? ' - ' + finalNote : ''),
+      operator || null);
+  }
+  return generateDisposalOrder(persisted.waybill_no, { audience: 'internal' });
+}
+
+function batchRiskBoard(waybillNos) {
+  const groups = {
+    rejection_recommended: [],
+    review_required: [],
+    suggest_signoff: []
+  };
+  const flags = [];
+
+  for (const no of waybillNos) {
+    const summary = summarizeWaybillAudit(no);
+    if (!summary) continue;
+    const level = summary.signoff_risk ? summary.signoff_risk.level : 'suggest_signoff';
+    const entry = {
+      waybill_no: no,
+      signoff_level: level,
+      signoff_label: summary.signoff_risk ? summary.signoff_risk.label : null,
+      responsibility_tendency: summary.responsibility_tendency ?
+        summary.responsibility_tendency.tendency : null,
+      quality_priority: summary.quality_inspection ?
+        summary.quality_inspection.sampling_priority : null,
+      violation_count: summary.status_counts ? summary.status_counts.violation || 0 : 0,
+      flags: []
+    };
+    if (summary.quality_inspection && summary.quality_inspection.sampling_priority === 'high') {
+      entry.flags.push('need_quality_inspection');
+    }
+    if (summary.responsibility_tendency &&
+        summary.responsibility_tendency.tendency === 'equipment') {
+      entry.flags.push('need_equipment_followup');
+    }
+    if (groups[level]) {
+      groups[level].push(entry);
+    }
+    flags.push(entry);
+  }
+
+  return {
+    total: waybillNos.length,
+    grouped: {
+      rejection_recommended: {
+        label: '建议拒收',
+        count: groups.rejection_recommended.length,
+        waybills: groups.rejection_recommended
+      },
+      review_required: {
+        label: '建议复核',
+        count: groups.review_required.length,
+        waybills: groups.review_required
+      },
+      suggest_signoff: {
+        label: '建议签收',
+        count: groups.suggest_signoff.length,
+        waybills: groups.suggest_signoff
+      }
+    },
+    priority_flags: {
+      need_quality_inspection: groups.rejection_recommended
+        .concat(groups.review_required)
+        .filter(function(w) { return w.flags.indexOf('need_quality_inspection') >= 0; })
+        .map(function(w) { return w.waybill_no; }),
+      need_equipment_followup: flags
+        .filter(function(w) { return w.flags.indexOf('need_equipment_followup') >= 0; })
+        .map(function(w) { return w.waybill_no; })
+    }
+  };
 }
 
 module.exports = {
@@ -1087,6 +1233,11 @@ module.exports = {
   summarizeWaybillAudit,
   generateEvidence,
   generateDisposalOrder,
+  getDisposalOrder,
+  getDisposalByWaybill,
+  addDisposalNote,
+  setDisposalFinalConclusion,
+  batchRiskBoard,
   generateTextConclusion,
   getTimePeriod,
   classifyTransportStage,

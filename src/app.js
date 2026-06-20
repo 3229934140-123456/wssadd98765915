@@ -1,7 +1,8 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const { initDb, zoneConfigRepo, waybillRepo, segmentRepo, auditRepo } = require('./db');
-const { processSegmentAudit, summarizeWaybillAudit, generateEvidence, generateDisposalOrder } = require('./auditEngine');
+const { processSegmentAudit, summarizeWaybillAudit, generateEvidence, generateDisposalOrder,
+  getDisposalOrder, addDisposalNote, setDisposalFinalConclusion, batchRiskBoard } = require('./auditEngine');
 
 let dbReady = false;
 let dbInitPromise = null;
@@ -45,7 +46,11 @@ async function createApp() {
         audit_results: 'GET /api/audits/waybill/:waybillNo',
         audit_summary: 'GET /api/summary/waybill/:waybillNo',
         evidence: 'POST /api/evidence/:waybillNo',
-        disposal: 'POST /api/disposal/:waybillNo',
+        disposal_create: 'POST /api/disposal/waybill/:waybillNo',
+        disposal_get: 'GET /api/disposal/:disposalId',
+        disposal_note: 'POST /api/disposal/:disposalId/note',
+        disposal_final: 'POST /api/disposal/:disposalId/final',
+        risk_board: 'POST /api/risk-board',
         health: 'GET /health'
       }
     });
@@ -220,7 +225,15 @@ async function createApp() {
         const d = a.details ? JSON.parse(a.details) : null;
         return Object.assign({}, a, { details: d });
       });
-      res.json({ code: 0, data: enriched, filters: filterOptions });
+      const summary = summarizeWaybillAudit(req.params.waybillNo);
+      const waybill_summary = summary ? {
+        overall_status: summary.overall_status,
+        signoff_risk: summary.signoff_risk,
+        responsibility_tendency: summary.responsibility_tendency,
+        quality_inspection: summary.quality_inspection,
+        status_counts: summary.status_counts
+      } : null;
+      res.json({ code: 0, data: enriched, filters: filterOptions, waybill_summary: waybill_summary });
     } catch (e) {
       res.status(500).json({ code: 500, error: e.message });
     }
@@ -256,18 +269,84 @@ async function createApp() {
     }
   });
 
-  app.post('/api/disposal/:waybillNo', function(req, res) {
+  app.post('/api/disposal/waybill/:waybillNo', function(req, res) {
     try {
       const opts = {};
       opts.audience = (req.body && req.body.audience) || 'internal';
       if (['internal', 'customer'].indexOf(opts.audience) < 0) {
         return res.status(400).json({ code: 400, error: 'audience 必须是 internal 或 customer' });
       }
+      if (!waybillRepo.getByNo(req.params.waybillNo)) {
+        return res.status(404).json({ code: 404, error: '运单不存在' });
+      }
       const disposal = generateDisposalOrder(req.params.waybillNo, opts);
       if (!disposal) {
         return res.status(404).json({ code: 404, error: '运单不存在' });
       }
       res.json({ code: 0, data: disposal });
+    } catch (e) {
+      res.status(500).json({ code: 500, error: e.message });
+    }
+  });
+
+  app.get('/api/disposal/:disposalId', function(req, res) {
+    try {
+      const audience = req.query.audience || 'internal';
+      if (['internal', 'customer'].indexOf(audience) < 0) {
+        return res.status(400).json({ code: 400, error: 'audience 必须是 internal 或 customer' });
+      }
+      const disposal = getDisposalOrder(req.params.disposalId, { audience: audience });
+      if (!disposal) {
+        return res.status(404).json({ code: 404, error: '处置单不存在' });
+      }
+      res.json({ code: 0, data: disposal });
+    } catch (e) {
+      res.status(500).json({ code: 500, error: e.message });
+    }
+  });
+
+  app.post('/api/disposal/:disposalId/note', function(req, res) {
+    try {
+      const body = req.body || {};
+      if (!body.party) {
+        return res.status(400).json({ code: 400, error: 'party 必填' });
+      }
+      const disposal = addDisposalNote(req.params.disposalId, body.party, body.note, body.operator);
+      if (!disposal) {
+        return res.status(404).json({ code: 404, error: '处置单不存在' });
+      }
+      res.json({ code: 0, data: disposal });
+    } catch (e) {
+      res.status(400).json({ code: 400, error: e.message });
+    }
+  });
+
+  app.post('/api/disposal/:disposalId/final', function(req, res) {
+    try {
+      const body = req.body || {};
+      if (!body.final_responsibility) {
+        return res.status(400).json({ code: 400, error: 'final_responsibility 必填' });
+      }
+      const disposal = setDisposalFinalConclusion(req.params.disposalId,
+        body.final_responsibility, body.final_note, body.operator);
+      if (!disposal) {
+        return res.status(404).json({ code: 404, error: '处置单不存在' });
+      }
+      res.json({ code: 0, data: disposal });
+    } catch (e) {
+      res.status(400).json({ code: 400, error: e.message });
+    }
+  });
+
+  app.post('/api/risk-board', function(req, res) {
+    try {
+      const body = req.body || {};
+      const waybillNos = body.waybill_nos;
+      if (!waybillNos || !Array.isArray(waybillNos) || waybillNos.length === 0) {
+        return res.status(400).json({ code: 400, error: 'waybill_nos 数组必填' });
+      }
+      const result = batchRiskBoard(waybillNos);
+      res.json({ code: 0, data: result });
     } catch (e) {
       res.status(500).json({ code: 500, error: e.message });
     }

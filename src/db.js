@@ -104,9 +104,34 @@ function createTables() {
       audit_time DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS disposal_orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      disposal_id TEXT UNIQUE NOT NULL,
+      waybill_no TEXT NOT NULL,
+      status TEXT DEFAULT 'open',
+      signoff_level TEXT,
+      responsibility_tendency TEXT,
+      quality_priority TEXT,
+      final_responsibility TEXT,
+      final_note TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS disposal_notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      disposal_id TEXT NOT NULL,
+      party TEXT NOT NULL,
+      note TEXT,
+      operator TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE INDEX IF NOT EXISTS idx_segments_waybill ON temperature_segments(waybill_no);
     CREATE INDEX IF NOT EXISTS idx_audit_waybill ON audit_results(waybill_no);
     CREATE INDEX IF NOT EXISTS idx_segments_time ON temperature_segments(waybill_no, start_time);
+    CREATE INDEX IF NOT EXISTS idx_disposal_waybill ON disposal_orders(waybill_no);
+    CREATE INDEX IF NOT EXISTS idx_disposal_notes ON disposal_notes(disposal_id);
   `;
   db.run(sql);
 }
@@ -378,10 +403,72 @@ const auditRepo = {
   }
 };
 
+const disposalRepo = {
+  getByDisposalId: function(disposalId) {
+    return get('SELECT * FROM disposal_orders WHERE disposal_id = ?', [disposalId]);
+  },
+  getByWaybill: function(waybillNo) {
+    return get('SELECT * FROM disposal_orders WHERE waybill_no = ? ORDER BY id DESC LIMIT 1', [waybillNo]);
+  },
+  create: function(data) {
+    const sql = `
+      INSERT INTO disposal_orders (disposal_id, waybill_no, status, signoff_level,
+        responsibility_tendency, quality_priority)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `;
+    run(sql, [data.disposal_id, data.waybill_no, data.status || 'open',
+      data.signoff_level || null, data.responsibility_tendency || null,
+      data.quality_priority || null]);
+    return disposalRepo.getByDisposalId(data.disposal_id);
+  },
+  upsertByWaybill: function(data) {
+    const existing = disposalRepo.getByWaybill(data.waybill_no);
+    if (existing) {
+      const sql = `
+        UPDATE disposal_orders SET signoff_level = ?, responsibility_tendency = ?,
+          quality_priority = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE disposal_id = ?
+      `;
+      run(sql, [data.signoff_level || null, data.responsibility_tendency || null,
+        data.quality_priority || null, existing.disposal_id]);
+      return disposalRepo.getByDisposalId(existing.disposal_id);
+    }
+    return disposalRepo.create(data);
+  },
+  updateStatus: function(disposalId, status) {
+    run('UPDATE disposal_orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE disposal_id = ?',
+      [status, disposalId]);
+    return disposalRepo.getByDisposalId(disposalId);
+  },
+  setFinalConclusion: function(disposalId, finalResponsibility, finalNote) {
+    run(`
+      UPDATE disposal_orders SET final_responsibility = ?, final_note = ?,
+        status = 'closed', updated_at = CURRENT_TIMESTAMP
+      WHERE disposal_id = ?
+    `, [finalResponsibility || null, finalNote || null, disposalId]);
+    return disposalRepo.getByDisposalId(disposalId);
+  },
+  addNote: function(disposalId, party, note, operator) {
+    const sql = `
+      INSERT INTO disposal_notes (disposal_id, party, note, operator)
+      VALUES (?, ?, ?, ?)
+    `;
+    run(sql, [disposalId, party, note || null, operator || null]);
+    return disposalRepo.getNotes(disposalId);
+  },
+  getNotes: function(disposalId) {
+    return all('SELECT * FROM disposal_notes WHERE disposal_id = ? ORDER BY created_at ASC', [disposalId]);
+  },
+  getLatestNote: function(disposalId) {
+    return get('SELECT * FROM disposal_notes WHERE disposal_id = ? ORDER BY created_at DESC LIMIT 1', [disposalId]);
+  }
+};
+
 module.exports = {
   initDb,
   zoneConfigRepo,
   waybillRepo,
   segmentRepo,
-  auditRepo
+  auditRepo,
+  disposalRepo
 };
