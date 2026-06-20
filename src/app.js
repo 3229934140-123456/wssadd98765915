@@ -71,6 +71,14 @@ async function createApp() {
       if (!body.waybill_no || !body.meat_type || !body.zone_code) {
         return res.status(400).json({ code: 400, error: 'waybill_no, meat_type, zone_code 必填' });
       }
+      const zoneConfig = zoneConfigRepo.getByCode(body.zone_code);
+      if (!zoneConfig) {
+        const validCodes = zoneConfigRepo.getAll().map(function(z) { return z.zone_code; });
+        return res.status(400).json({
+          code: 400,
+          error: '不支持的温区编码: ' + body.zone_code + '，当前支持的编码: ' + validCodes.join(', ')
+        });
+      }
       const existing = waybillRepo.getByNo(body.waybill_no);
       if (existing) {
         return res.json({ code: 0, data: existing, message: '运单已存在' });
